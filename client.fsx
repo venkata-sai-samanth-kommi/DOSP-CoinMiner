@@ -1,149 +1,141 @@
 #time "on"
 #r "nuget: Akka.FSharp" 
 #r "nuget: Akka.Remote"
+
 open System
 open Akka.Actor
 open Akka.Configuration
 open Akka.FSharp
 
-
-let serverip =  "192.168.0.100"
-let port = 9090 |> string
-
-let serverAddress = "akka.tcp://RemoteServer@" + serverip + ":" + port + "/user/RemoteBoss"
-let printerAddress = "akka.tcp://RemoteServer@" + serverip + ":" + port + "/user/RemotePrinter"
-
 let configuration = 
     ConfigurationFactory.ParseString(
         @"akka {
-            log-config-on-start : on
-            stdout-loglevel : DEBUG
-            loglevel : ERROR
+            stdout-loglevel : off
+            loglevel : off
             actor {
-                provider = ""Akka.Remote.RemoteActorRefProvider, Akka.Remote""
-                debug : {
-                    receive : on
-                    autoreceive : on
-                    lifecycle : on
-                    event-stream : on
-                    unhandled : on
-                }
+                provider = ""Akka.Remote.RemoteActorRefProvider, Akka.Remote""              
             }
             remote {
                 helios.tcp {
                     port = 8778
-                    hostname = 192.168.0.100
+                    hostname = localhost
                 }
             }
         }")
 
 let system = ActorSystem.Create("RemoteClient", configuration)
 
-let rem  = system.ActorSelection(serverAddress)
-let remoteprinter = system.ActorSelection(printerAddress)
+let serverIPAdress =  fsi.CommandLineArgs.[1]
+let serverPort = 9090 |> string
+let universityOfFloridaUserName = "vkommi;"
 
-type WorkerMsg =
-    | Done of string * string
-    | StartWork of string
+let getRemoteAddress (serverip : string) (port : string) (actorName : string) =
+    "akka.tcp://RemoteServer@" + serverip + ":" + port + "/user/" + actorName
 
-let sha256: string -> string =
-    let byteToHex: byte -> string = fun b -> b.ToString("x2")
+type WorkState =
+    | Finished of string * string
+    | Begin of string
 
-    let bytesToHex: byte array -> string =
-        fun bytes ->
-            bytes
-            |> Array.fold (fun a x -> a + (byteToHex x)) ""
-
-    let utf8ToBytes: string -> byte array = System.Text.Encoding.UTF8.GetBytes
-
-    let tosha256: byte array -> byte array =
-        fun bytes ->
+let getHash: string -> string =
+    let convertToSHA256: byte array -> byte array =
+        fun bytesToBeConverted ->
             use sha256 =
                 System.Security.Cryptography.SHA256.Create()
-            sha256.ComputeHash(buffer = bytes)
+            sha256.ComputeHash(buffer = bytesToBeConverted)
+    fun str -> str |> (System.Text.Encoding.UTF8.GetBytes >> convertToSHA256 >> fun res -> res |> Array.fold (fun s1 s2 -> s1 + (s2.ToString("x2"))) "")
 
-    fun utf8 -> utf8 |> (utf8ToBytes >> tosha256 >> bytesToHex)
 
-let mutable count = 0
+let checkIfHashBeginsWithKZeros (hash: string) (k: int) : Boolean =
 
-let checkZeroes (str: string) (zeroes: int) : Boolean =
-    let mutable a = true
-    for i = 0 to zeroes - 1 do
-        if (str.[i] <> '0') then a <- false
-    if a then 
-        count <- count+1
-    a
+    let mutable count = 0
+    let mutable breakLoop = false
+    let mutable result = false
 
-let getRandomString = 
-    let alphaNumeric = "abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_-+={}[]|';:><,./?"
-    let charsLen = alphaNumeric.Length
-    fun len -> 
-        let random = Random()
-        let mutable str = ""
-        for i in 0..len do 
-            let value = random.Next(charsLen)
+    for i = 0 to hash.Length do
+        if ( not breakLoop) then
+            if (hash.[i] = '0') then
+                count <- count+1                
+            else                
+                breakLoop <- true
+
+    if (count >= k) then
+        result <- true
+
+    result
+
+let randomStringGenerator = 
+    fun desiredSize -> 
+        let randomInstance = Random()
+        let mutable randomString = ""
+        let alphaNumeric = "abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_-+={}[]|';:><,./?"
+        for i in 0..desiredSize do 
+            let value = randomInstance.Next(alphaNumeric.Length)
             let partial = (alphaNumeric.[value]).ToString()
-            str <- str+partial            
-        str
+            randomString <- randomString+partial 
+        randomString
 
-let worker (mailbox: Actor<_>) = 
+let CoinMiner (postBox: Actor<_>) = 
     let rec loop () = actor {
-        let mutable flag = true
-        let! message = mailbox.Receive ()
-        let server = mailbox.Sender
-        while(flag) do           
-            let command = (message|>string).Split ','             
-            let len: int = command.[1] |> int
-            let k: string = command.[0]
-            let value = k |> int             
-            let mutable str = getRandomString len
-            let encoded = ("vkommi;" + str) |> sha256 
-            let shouldConclude : bool = checkZeroes (encoded) (value)
-            if shouldConclude then
-                flag <- false                        
-                mailbox.Context.Sender <! Done ("vkommi;"+str,  encoded)    
+        let mutable shouldConclude = false
+        let! order = postBox.Receive ()
+        while(not shouldConclude) do           
+            let random = Random()
+            let numberOfZeros = (order|> string |> int)                       
+            let randomString = randomStringGenerator (random.Next(60) |> int)
+            let hashValue = (universityOfFloridaUserName + randomString) |> getHash             
+            shouldConclude <- checkIfHashBeginsWithKZeros (hashValue) (numberOfZeros)            
+            if shouldConclude then        
+                postBox.Context.Sender <! Finished (universityOfFloridaUserName+randomString,  hashValue) 
+
         return! loop ()
     }
     loop ()
 
-let mutable i = 0
+let remoteServer  = system.ActorSelection(getRemoteAddress serverIPAdress serverPort "Lord")
+let remoteprinter = system.ActorSelection(getRemoteAddress serverIPAdress serverPort "PrintingActor")
 
-let mutable strlen = 1
-
-let createWorkers (mailbox: Actor<_>) = 
+let workersGenerator (postBox: Actor<_>) = 
     let rec loop () = actor {
-        let! message = mailbox.Receive ()
-        match message with 
-            | Done (x,y)  -> 
-                        remoteprinter <! (x+" "+y)
-                        mailbox.Context.Self.Tell(PoisonPill.Instance, mailbox.Self)
-                        mailbox.Context.Stop(mailbox.Context.Self) |> ignore
-                        mailbox.Context.Stop(mailbox.Context.Parent) |> ignore                        
-                        system.Terminate() |> ignore
-            | StartWork x ->  while(i <> 1) do
-                                i <- i+1
-                                let nameOfTheWorker = "worker" + i.ToString()                                
-                                let worker = spawn system nameOfTheWorker worker               
-                                worker <! (x+","+strlen.ToString())
-                                strlen <- strlen + 1
+        let! order = postBox.Receive ()
+        match order with 
+            | Finished (str, hash)  -> 
+                            remoteprinter <! (str+" "+hash)
+                            printfn "Results generated and sent to the server!"
+                            printf "------------------------------------------------------------------------------------\n" 
+                            postBox.Context.Self.Tell(PoisonPill.Instance, postBox.Self)
+                            postBox.Context.Stop(postBox.Context.Self) |> ignore
+                            postBox.Context.Stop(postBox.Context.Parent) |> ignore                        
+                            system.Terminate() |> ignore
+
+            | Begin numberOfZeros ->    printfn "generating workers on client side"
+                                        let arrWorkers=[for i in 1..2 do yield(spawn system ("Miner" + i.ToString())) CoinMiner]                                                                  
+                                        let workerSystem = system.ActorOf(Props.Empty.WithRouter(Akka.Routing.RoundRobinGroup(arrWorkers)))
+                                        workerSystem <! numberOfZeros                                           
                         
         return! loop ()
     }
     loop ()
 
-let RemoteClient = 
-    spawn system "RemoteClient"
-    <| fun mailbox ->
+let Slave = 
+    spawn system "Slave"
+    <| fun postBox ->
         let rec loop() =
             actor {
-                let! (message:obj) = mailbox.Receive()
-                printfn "%A" message
-                let createWorkersRef = spawn system "createWorkers" createWorkers
-                createWorkersRef <! StartWork (message.ToString())  
+                let! (order:obj) = postBox.Receive()
+                if ((order |> string) <> "die") then
+                    printfn "Received number of leading zero's = %s from the server" (order.ToString())      
+                    let createWorkersRef = spawn system "createWorkers" workersGenerator
+                    createWorkersRef <! Begin (order.ToString()) 
+                else 
+                    printfn "Coin found by some other :-( terminating self....."
+                    postBox.Context.Self.Tell(PoisonPill.Instance, postBox.Self)                      
+                    system.Terminate() |> ignore
                 return! loop()
             }
-        printf "Remote Client Started \n" 
+        printf "------------------------------------------------------------------------------------\n" 
+        printf "Remote client Started \n" 
         loop()
 
-rem <! "192.168.0.100:8778"
+remoteServer <! "localhost:8778"
+
 system.WhenTerminated.Wait()
